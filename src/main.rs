@@ -46,9 +46,16 @@ const BLACK_HOLE_FUZZ_CUT_DB: f32 = 14.0;
 /// Asymmetric bias of the first clipper (even harmonics, "sputter").
 const ASYM_BIAS: f32 = 0.3;
 
-/// Noise gate thresholds on the input envelope (linear), with hysteresis.
+/// Noise gate thresholds on the input envelope (linear), with hysteresis, and
+/// its fade-out time (s).
 const GATE_OPEN: f32 = 0.0012;
 const GATE_CLOSE: f32 = 0.0006;
+const GATE_FADE_S: f32 = 0.06;
+/// Black Hole modes run 14 dB less fuzz (so 14 dB less hiss), and their notes
+/// are left to ring: the gate sits this much lower (dB) and fades out slowly,
+/// so it doesn't chop the tails off.
+const BLACK_HOLE_GATE_DB: f32 = -18.0;
+const BLACK_HOLE_GATE_FADE_S: f32 = 0.3;
 
 /// Feedback loop: delay (samples, ~ distance amp -> guitar), band-pass centre
 /// and Q (where the howl blooms), and loop gain at full bloom.
@@ -135,6 +142,8 @@ struct Sg {
     c_rel: f32,
     c_gate_open: f32,
     c_gate_close: f32,
+    c_gate_close_bh: f32,
+    gate_scale_bh: f32,
     c_fb_up: f32,
     c_fb_down: f32,
 }
@@ -185,6 +194,8 @@ impl Sg {
         c_rel: 1.0,
         c_gate_open: 1.0,
         c_gate_close: 1.0,
+        c_gate_close_bh: 1.0,
+        gate_scale_bh: 1.0,
         c_fb_up: 1.0,
         c_fb_down: 1.0,
     };
@@ -211,7 +222,9 @@ impl Sg {
         self.c_att = coef(0.001);
         self.c_rel = coef(0.08);
         self.c_gate_open = coef(0.002);
-        self.c_gate_close = coef(0.06);
+        self.c_gate_close = coef(GATE_FADE_S);
+        self.c_gate_close_bh = coef(BLACK_HOLE_GATE_FADE_S);
+        self.gate_scale_bh = db(BLACK_HOLE_GATE_DB);
         self.c_fb_up = coef(FB_BLOOM_S / 3.0); // ~95% bloomed after FB_BLOOM_S
         self.c_fb_down = coef(FB_DIE_S);
         self.retarget();
@@ -272,15 +285,17 @@ impl Sg {
 
         let x = self.hp_in.process(x);
 
-        // Gate on the input envelope.
+        // Gate on the input envelope; lower and gentler in the Black Hole modes.
         let a = x.abs();
         self.env += (a - self.env) * if a > self.env { self.c_att } else { self.c_rel };
-        if self.env > GATE_OPEN {
+        let (scale, fade) =
+            if self.mode == HEAVY { (1.0, self.c_gate_close) } else { (self.gate_scale_bh, self.c_gate_close_bh) };
+        if self.env > GATE_OPEN * scale {
             self.gate_open = true;
-        } else if self.env < GATE_CLOSE {
+        } else if self.env < GATE_CLOSE * scale {
             self.gate_open = false;
         }
-        let (gt, gc) = if self.gate_open { (1.0, self.c_gate_open) } else { (0.0, self.c_gate_close) };
+        let (gt, gc) = if self.gate_open { (1.0, self.c_gate_open) } else { (0.0, fade) };
         self.gate += (gt - self.gate) * gc;
 
         // Feedback blooms while a note sustains and dies as soon as it's muted.
