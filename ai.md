@@ -34,6 +34,8 @@ entry is marked as superseded).
    `../nirvana` ("Smells Like Teen Spirit") and `../ironButterfly`
    ("In-A-Gadda-Da-Vida"). Each has its own `ai.md`.
 
+5. On `master`, add the demo render (`cargo sim` output) as `samples/soundgarden_demo.wav`. Commit with the message "ai" and push.
+
 ### Implementation decisions (needed to recreate requirement 3)
 
 - **Language and ABI.** Write it in `no_std` Rust (edition 2024, nightly toolchain,
