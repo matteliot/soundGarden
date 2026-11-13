@@ -1,15 +1,18 @@
 //! Host-only demo renderer: `cargo sim [OUT.wav]`.
 //!
-//! Synthesises a Karplus-Strong "guitar" playing a drop-D riff in 7/8, drives
+//! Plays a drop-D riff in 7/8 on a modelled electric guitar (see `guitar`:
+//! exact tuning, pick and pickup, palm mutes, strums, human timing), drives
 //! the patch's entry points the way the firmware does (128-sample blocks,
 //! footswitch presses/holds at set times) and writes a stereo float WAV.
 //! Prints per-section level stats and fails on NaN or clipping.
 
-use crate::abi::*;
+use crate::guitar::{Note, Player};
 use crate::*;
 
 const N: usize = 128;
 const SRU: usize = 48_000;
+/// The modelled guitar into this patch, matched to the level the patch was voiced for.
+const INPUT_TRIM: f32 = 0.6;
 
 // Drop D, a few dissonant neighbours.
 const D2: f32 = 73.42;
@@ -25,38 +28,30 @@ const D4: f32 = 293.66;
 const F4: f32 = 349.23;
 
 enum Ev {
-    /// Pluck these notes; `mute` stops whatever is still ringing first.
-    Chord(&'static [f32], bool),
+    /// Play these notes, strummed this many seconds apart; `ring` lets what's already sounding carry on.
+    Play(Vec<Note>, f32, bool),
     Press,
     Hold,
-}
-
-struct Ks {
-    buf: Vec<f32>,
-    i: usize,
-    damp: f32,
-}
-
-impl Ks {
-    fn tick(&mut self) -> f32 {
-        let n = self.buf.len();
-        let a = self.buf[self.i];
-        let b = self.buf[(self.i + 1) % n];
-        self.buf[self.i] = self.damp * 0.5 * (a + b);
-        self.i = (self.i + 1) % n;
-        a
-    }
 }
 
 fn score() -> (Vec<(f64, Ev, &'static str)>, f64) {
     let mut ev = vec![];
     let eighth = 0.2;
-    // Heavy: 4 bars of 7/8 over an open low-D drone, flat-2 and tritone rubs.
+    // Small, repeatable timing slop: nobody plays exactly on the grid.
+    let mut seed: u32 = 0x1357_9bdf;
+    let mut slop = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f64 / u32::MAX as f64 * 2.0 - 1.0) * 0.006
+    };
+    // Heavy: 4 bars of 7/8 over an open low-D drone, flat-2 and tritone rubs. Single low Ds are palm-muted chugs; the chords ring.
     let bar: [&'static [f32]; 7] = [&[D2, A2, D3], &[D2], &[D2], &[D2, EB3], &[D2], &[D2, GS3], &[C3, F3]];
     let mut t = 0.1;
     for _ in 0..4 {
-        for c in bar {
-            ev.push((t, Ev::Chord(c, true), ""));
+        for (k, c) in bar.into_iter().enumerate() {
+            let notes: Vec<Note> = if c.len() == 1 { vec![Note::new(c[0]).pm()] } else { c.iter().map(|f| Note::new(*f).vel(if k == 0 { 0.95 } else { 0.85 })).collect() };
+            ev.push((t + slop(), Ev::Play(notes, 0.009, false), ""));
             t += eighth;
         }
     }
@@ -65,13 +60,8 @@ fn score() -> (Vec<(f64, Ev, &'static str)>, f64) {
         ev.push((t, Ev::Press, label));
         t += 0.1;
         for root in [D3, CS3, C3] {
-            let notes: [&'static [f32]; 4] = match root {
-                D3 => [&[D3], &[A3], &[D4], &[F4]],
-                CS3 => [&[CS3], &[A3], &[D4], &[F4]],
-                _ => [&[C3], &[A3], &[D4], &[F4]],
-            };
-            for (k, n) in notes.into_iter().enumerate() {
-                ev.push((t, Ev::Chord(n, k == 0), ""));
+            for (k, f) in [root, A3, D4, F4].into_iter().enumerate() {
+                ev.push((t + slop(), Ev::Play(vec![Note::new(f).vel(0.7)], 0.0, k != 0), ""));
                 t += 0.33;
             }
         }
@@ -81,7 +71,8 @@ fn score() -> (Vec<(f64, Ev, &'static str)>, f64) {
     if std::env::var_os("SG_NO_FEEDBACK").is_none() {
         ev.push((t + 0.01, Ev::Hold, ""));
     }
-    ev.push((t + 0.1, Ev::Chord(&[D2, A2, D3], true), ""));
+    // Held in front of a loud amp, the strings keep ringing (the amp drives them), so this chord sustains far longer than a plucked one would.
+    ev.push((t + 0.1, Ev::Play([D2, A2, D3].iter().map(|f| Note::new(*f).vel(0.95).t60(30.0)).collect(), 0.012, false), ""));
     t += 6.0;
     (ev, t)
 }
@@ -99,16 +90,9 @@ pub fn main() {
     }
 
     let (mut events, total_s) = score();
-    events.reverse();
+    events.sort_by(|a, b| b.0.total_cmp(&a.0));
     let total = (total_s * SRU as f64) as usize;
-    let mut voices: Vec<Ks> = vec![];
-    let mut seed: u32 = 0x1234_5678;
-    let mut rnd = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        seed as f32 / u32::MAX as f32 * 2.0 - 1.0
-    };
+    let mut guitar = Player::new();
 
     let mut lo = vec![];
     let mut ro = vec![];
@@ -120,24 +104,7 @@ pub fn main() {
             match e {
                 Ev::Press => unsafe { special_action(&env, ACTION_FOOTSWITCH_PRESS) },
                 Ev::Hold => unsafe { special_action(&env, ACTION_FOOTSWITCH_HOLD) },
-                Ev::Chord(notes, mute) => {
-                    if mute {
-                        voices.iter_mut().for_each(|v| v.damp = 0.6);
-                    }
-                    for &f in notes {
-                        let n = (SRU as f32 / f).round() as usize;
-                        // Pick noise, slightly low-passed.
-                        let mut prev = 0.0;
-                        let buf = (0..n)
-                            .map(|_| {
-                                prev = 0.6 * prev + 0.4 * rnd();
-                                prev * 0.12
-                            })
-                            .collect();
-                        voices.push(Ks { buf, i: 0, damp: 0.997 });
-                    }
-                    voices.retain(|v| v.damp > 0.9 || v.buf.iter().any(|x| x.abs() > 1e-4));
-                }
+                Ev::Play(notes, strum, ring) => guitar.play(&notes, strum, ring),
             }
             if !label.is_empty() {
                 sections.push((t, label));
@@ -146,7 +113,7 @@ pub fn main() {
         let mut l = [0.0f32; N];
         let mut r = [0.0f32; N];
         for x in l.iter_mut() {
-            *x = voices.iter_mut().map(Ks::tick).sum();
+            *x = guitar.tick() * INPUT_TRIM;
         }
         unsafe { update_buffers(&env, l.as_mut_ptr(), r.as_mut_ptr(), N as i32) };
         lo.extend_from_slice(&l);

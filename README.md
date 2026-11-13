@@ -43,6 +43,6 @@ cargo build --release        # ELF for the pedal (default target is thumbv7em-no
 cargo sim                    # -> target/render/soundgarden_demo.wav
 ```
 
-This renders a synthesized drop-D riff in 7/8 through the same patch code. It
+This renders a synthesized drop-D riff in 7/8 on a modelled electric guitar (`src/guitar.rs`: exact tuning, pick and humbucker, palm mutes, strums, vibrato and human timing) through the same patch code. It
 goes through Heavy, then Black Hole slow, then Black Hole fast, then Heavy with
 a sustained chord and feedback on. Then it prints the level of each section.

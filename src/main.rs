@@ -91,6 +91,18 @@ const BLACK_HOLE_MAKEUP_DB: f32 = 9.0;
 
 // ---------------------------------------------------------------- state
 
+/// The delay lines. They are all zero at rest, so they live in .bss and add
+/// nothing to the patch file; `patch_init` zeroes them before use.
+struct Bufs {
+    fb_line: Delay<512>,
+    horn: Delay<128>,
+    drum: Delay<64>,
+}
+
+impl Bufs {
+    const NEW: Self = Self { fb_line: Delay::NEW, horn: Delay::NEW, drum: Delay::NEW };
+}
+
 struct Sg {
     ready: bool,
     error: bool,
@@ -123,11 +135,8 @@ struct Sg {
     env: f32,
     gate: f32,
     gate_open: bool,
-    fb_line: Delay<512>,
     // rotary
     xover: OnePole,
-    horn: Delay<128>,
-    drum: Delay<64>,
     horn_ph: f32,
     drum_ph: f32,
     horn_hz: f32,
@@ -177,10 +186,7 @@ impl Sg {
         env: 0.0,
         gate: 0.0,
         gate_open: false,
-        fb_line: Delay::NEW,
         xover: OnePole::NEW,
-        horn: Delay::NEW,
-        drum: Delay::NEW,
         horn_ph: 0.0,
         drum_ph: 0.0,
         horn_hz: HORN_SLOW,
@@ -248,7 +254,7 @@ impl Sg {
         self.mid_eq.peak(750.0, 0.8, -4.0 + 16.0 * self.mids);
     }
 
-    fn rotary(&mut self, y: f32) -> (f32, f32) {
+    fn rotary(&mut self, bf: &mut Bufs, y: f32) -> (f32, f32) {
         let fast = self.mode == BLACK_HOLE_FAST;
         let (ht, dt) = if fast { (HORN_FAST, DRUM_FAST) } else { (HORN_SLOW, DRUM_SLOW) };
         self.horn_hz += (ht - self.horn_hz) * self.c_horn;
@@ -263,20 +269,20 @@ impl Sg {
             self.drum_ph += TAU;
         }
         let lo = self.xover.process(y);
-        self.horn.push(y - lo);
-        self.drum.push(lo);
+        bf.horn.push(y - lo);
+        bf.drum.push(lo);
         let (hc, hs) = (cos(self.horn_ph), sin(self.horn_ph));
         let (dc, ds) = (cos(self.drum_ph), sin(self.drum_ph));
         let (mc, ms) = self.mic_r;
         // facing = cos(rotor - mic) in [-1, 1]: 1 when the rotor points at the mic.
-        let l = tap(&self.horn, hc, HORN_DOPPLER, HORN_AM) + tap(&self.drum, dc, DRUM_DOPPLER, DRUM_AM);
-        let r = tap(&self.horn, hc * mc + hs * ms, HORN_DOPPLER, HORN_AM)
-            + tap(&self.drum, dc * mc + ds * ms, DRUM_DOPPLER, DRUM_AM);
+        let l = tap(&bf.horn, hc, HORN_DOPPLER, HORN_AM) + tap(&bf.drum, dc, DRUM_DOPPLER, DRUM_AM);
+        let r = tap(&bf.horn, hc * mc + hs * ms, HORN_DOPPLER, HORN_AM)
+            + tap(&bf.drum, dc * mc + ds * ms, DRUM_DOPPLER, DRUM_AM);
         (l, r)
     }
 
     #[inline]
-    fn tick(&mut self, x: f32) -> (f32, f32) {
+    fn tick(&mut self, bf: &mut Bufs, x: f32) -> (f32, f32) {
         self.g1 += (self.g1_t - self.g1) * self.c_param;
         self.g2 += (self.g2_t - self.g2) * self.c_param;
         self.out_g += (self.out_t - self.out_g) * self.c_param;
@@ -303,7 +309,7 @@ impl Sg {
         // the bloom) is the same at any Fuzz setting.
         let ft = if self.feedback && self.gate_open { 1.0 } else { 0.0 };
         self.fb_ramp += (ft - self.fb_ramp) * if ft > self.fb_ramp { self.c_fb_up } else { self.c_fb_down };
-        let fb = self.fb_line.read(FB_DELAY) * self.fb_ramp * FB_LOOP / (self.g1 * self.g2);
+        let fb = bf.fb_line.read(FB_DELAY) * self.fb_ramp * FB_LOOP / (self.g1 * self.g2);
 
         // Two fuzz stages, each with cheap 2x oversampling (linear-interpolated
         // midpoint, averaged back down).
@@ -315,14 +321,14 @@ impl Sg {
         let y = 0.5 * (tanh(0.5 * (u + self.u2)) + tanh(u));
         self.u2 = u;
         let y = y * self.gate;
-        self.fb_line.push(self.fb_bp.process(y));
+        bf.fb_line.push(self.fb_bp.process(y));
 
         let mut y = self.mid_eq.process(y);
         for b in self.cab.iter_mut() {
             y = b.process(y);
         }
 
-        let (rl, rr) = self.rotary(y);
+        let (rl, rr) = self.rotary(bf, y);
         let l = (y + (rl - y) * self.wet) * self.out_g;
         let r = (y + (rr - y) * self.wet) * self.out_g;
         (limit(l), limit(r))
@@ -364,14 +370,30 @@ fn limit(x: f32) -> f32 {
 
 /// All patch state. The firmware calls every entry point from the audio
 /// thread (SDK: "no need to synchronize"). Lives in .bss/.data.
-struct Global(UnsafeCell<Sg>);
-unsafe impl Sync for Global {}
-static STATE: Global = Global(UnsafeCell::new(Sg::NEW));
+struct Global<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for Global<T> {}
+static STATE: Global<Sg> = Global(UnsafeCell::new(Sg::NEW));
+static BUFS: Global<Bufs> = Global(UnsafeCell::new(Bufs::NEW));
 
 #[allow(clippy::mut_from_ref)]
 fn state() -> &'static mut Sg {
     // SAFETY: single-threaded access from the firmware's audio thread.
     unsafe { &mut *STATE.0.get() }
+}
+
+#[allow(clippy::mut_from_ref)]
+fn bufs() -> &'static mut Bufs {
+    // SAFETY: as `state`.
+    unsafe { &mut *BUFS.0.get() }
+}
+
+/// Zeroes the delay lines in place. The loader should already have cleared
+/// .bss, but nothing promises it, and a NaN left in a feedback loop never
+/// decays. (In place: a zeroed copy would be a stack temporary.)
+fn clear_bufs() {
+    // SAFETY: `Bufs` is only f32 and usize fields, so all-zero bits are a
+    // valid value; single-threaded as `state`.
+    unsafe { core::ptr::write_bytes(BUFS.0.get(), 0, 1) }
 }
 
 // ---------------------------------------------------------------- entry points
@@ -384,6 +406,7 @@ unsafe extern "C" fn patch_init(env: *const PatchEnv) {
     if env.is_null() || unsafe { (*env).abi_version } != PATCH_ABI_VERSION as u32 {
         return;
     }
+    clear_bufs();
     state().init();
 }
 
@@ -394,12 +417,12 @@ unsafe extern "C" fn update_buffers(_: *const PatchEnv, left: *mut f32, right: *
     }
     // SAFETY: the firmware passes two buffers of `samples` floats.
     let (l, r) = unsafe { (core::slice::from_raw_parts_mut(left, n), core::slice::from_raw_parts_mut(right, n)) };
-    let s = state();
+    let (s, bf) = (state(), bufs());
     if !s.ready {
         return 0.0;
     }
     for (a, b) in l.iter_mut().zip(r.iter_mut()) {
-        let (ol, or) = s.tick(*a);
+        let (ol, or) = s.tick(bf, *a);
         *a = ol;
         *b = or;
     }
@@ -538,6 +561,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     }
 }
 
+#[cfg(not(target_os = "none"))]
+#[allow(dead_code)] // each demo uses only some of the playing techniques
+mod guitar;
 #[cfg(not(target_os = "none"))]
 mod host;
 
