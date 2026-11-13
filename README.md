@@ -27,6 +27,11 @@ plus a feedback loop (1.25 kHz band-pass, 7 ms delay) from the fuzz output back 
 The Leslie speeds up and slows down with rotor inertia (horn ~0.6 s, drum ~3 s),
 so switching between slow and fast ramps like the real thing.
 
+## Install
+
+Download [`release/soundgarden.endl`](release/soundgarden.endl) (on GitHub: open it and click the download button), connect the Endless
+to your computer over USB and copy the file onto the pedal. Nothing needs to be built. To rebuild it from source, see below.
+
 ## Build
 
 ```sh
